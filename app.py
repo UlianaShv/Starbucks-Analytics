@@ -4,6 +4,11 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from matplotlib.colors import LinearSegmentedColormap
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from sklearn.tree import DecisionTreeClassifier
+from scipy import stats
 
 st.set_page_config(
     page_title="Starbucks Customer Analytics & Segmentations",
@@ -11,7 +16,30 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-API_URL = "http://localhost:8000"
+CLUSTER_NAMES = {
+    0: "Fast & Standard",
+    1: "Patient & Standard",
+    2: "Dissatisfied",
+    3: "Bulk Buyers",
+    4: "Customization Kings"
+}
+
+@st.cache_resource
+def get_trained_models():
+    df = pd.read_csv("starbucks_customer_ordering_patterns.csv")
+    features = ['total_spend', 'num_customizations', 'cart_size', 'fulfillment_time_min', 'customer_satisfaction']
+    X_cls = df[features].copy()
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_cls)
+    kmeans = KMeans(n_clusters=5, random_state=42, n_init=10)
+    kmeans.fit(X_scaled)
+    
+    df['is_dissatisfied'] = (df['customer_satisfaction'] <= 3).astype(int)
+    dt = DecisionTreeClassifier(max_depth=1, random_state=42)
+    dt.fit(df[['fulfillment_time_min']], df['is_dissatisfied'])
+    threshold = float(dt.tree_.threshold[0])
+    
+    return scaler, kmeans, threshold
 
 from colors import COLORS, ACCENT_PALETTE, STARBUCKS_COLORS, SEGMENT_COLORS, STARBUCKS_CMAP
 
@@ -20,15 +48,8 @@ plt.rcParams['font.size'] = 11
 plt.rcParams['axes.titlesize'] = 14
 plt.rcParams['axes.labelsize'] = 12
 
-api_online = False
+api_online = True
 total_records = 0
-try:
-    health_check = requests.get(f"{API_URL}/")
-    if health_check.status_code == 200:
-        api_online = True
-        total_records = health_check.json().get("total_records", 0)
-except Exception:
-    pass
 
 def fmt_pct(val):
     return f"{val * 100:.2f}%"
@@ -48,7 +69,73 @@ def load_full_data():
         6: 'Summer', 7: 'Summer', 8: 'Summer',
         9: 'Autumn', 10: 'Autumn', 11: 'Autumn'
     })
+    
+    # Scale features and predict cluster
+    scaler, kmeans, _ = get_trained_models()
+    features = ['total_spend', 'num_customizations', 'cart_size', 'fulfillment_time_min', 'customer_satisfaction']
+    X_cls = df[features].copy()
+    X_scaled = scaler.transform(X_cls)
+    df['cluster'] = kmeans.predict(X_scaled)
+    df['segment'] = df['cluster'].map(CLUSTER_NAMES)
+    
     return df
+
+@st.cache_data
+def get_hypothesis1_data():
+    df = load_full_data()
+    _, _, threshold = get_trained_models()
+    
+    bins = np.arange(0, df['fulfillment_time_min'].max() + 1.5, 1)
+    df['fulfillment_bin'] = pd.cut(df['fulfillment_time_min'], bins=bins)
+    df['is_dissatisfied'] = (df['customer_satisfaction'] <= 3).astype(int)
+    
+    satisfaction_by_bin = df.groupby('fulfillment_bin', observed=False)['customer_satisfaction'].agg(['mean', 'count']).reset_index()
+    satisfaction_by_bin['fulfillment_bin'] = satisfaction_by_bin['fulfillment_bin'].astype(str)
+    satisfaction_by_bin['bin_str'] = satisfaction_by_bin['fulfillment_bin']
+    
+    under_pct = float(df[df['fulfillment_time_min'] <= threshold]['is_dissatisfied'].mean())
+    over_pct = float(df[df['fulfillment_time_min'] > threshold]['is_dissatisfied'].mean())
+    
+    df_10_11 = df[(df['fulfillment_time_min'] > 10) & (df['fulfillment_time_min'] <= 11)]
+    df_9_10 = df[(df['fulfillment_time_min'] > 9) & (df['fulfillment_time_min'] <= 10)]
+    
+    t_stat, p_val = stats.ttest_ind(df_10_11['customer_satisfaction'], df_9_10['customer_satisfaction'], equal_var=False)
+    
+    df_long = df[df['fulfillment_time_min'] > 8][['fulfillment_time_min', 'customer_satisfaction']].copy()
+    
+    anomaly_stats = {
+        "count": len(df_10_11),
+        "channels": df_10_11['order_channel'].value_counts().to_dict(),
+        "rewards_pct": float(df_10_11['is_rewards_member'].mean()),
+        "avg_spend": float(df_10_11['total_spend'].mean()),
+        "avg_customizations": float(df_10_11['num_customizations'].mean()),
+        "t_stat": float(t_stat),
+        "p_val": float(p_val)
+    }
+    
+    return threshold, satisfaction_by_bin, under_pct, over_pct, anomaly_stats, df_long
+
+@st.cache_data
+def get_hypothesis2_data():
+    df = load_full_data()
+    features = ['total_spend', 'num_customizations', 'cart_size', 'fulfillment_time_min', 'customer_satisfaction']
+    
+    profiles = df.groupby('segment')[features].mean().reindex(
+        ["Fast & Standard", "Patient & Standard", "Dissatisfied", "Bulk Buyers", "Customization Kings"]
+    ).reset_index()
+    
+    counts = df['segment'].value_counts().to_dict()
+    profiles['count'] = profiles['segment'].map(counts)
+    
+    channel_dist = pd.crosstab(df['segment'], df['order_channel']).reindex(
+        ["Fast & Standard", "Patient & Standard", "Dissatisfied", "Bulk Buyers", "Customization Kings"]
+    ).reset_index()
+    
+    rewards_ratio = df.groupby('segment')['is_rewards_member'].mean().reindex(
+        ["Fast & Standard", "Patient & Standard", "Dissatisfied", "Bulk Buyers", "Customization Kings"]
+    ).reset_index()
+    
+    return profiles, channel_dist, rewards_ratio
 
 @st.cache_data
 def compute_correlations():
@@ -149,38 +236,51 @@ def add_order_dialog():
         
     st.write("")
     if st.button("Save Order", use_container_width=True):
-        payload = {
-            "order_channel": order_channel,
-            "customer_age_group": customer_age_group,
-            "customer_gender": customer_gender,
-            "is_rewards_member": is_rewards_member,
-            "cart_size": int(cart_size),
-            "num_customizations": int(num_customizations),
-            "total_spend": float(total_spend),
-            "fulfillment_time_min": float(fulfillment_time_min),
-            "drink_category": drink_category,
-            "has_food_item": has_food_item,
-            "order_ahead": order_ahead,
-            "customer_satisfaction": int(customer_satisfaction)
-        }
         try:
-            res = requests.post(f"{API_URL}/orders", json=payload)
-            if res.status_code == 200:
-                res_data = res.json()
-                st.success(f"Success! Order created with ID: {res_data['order_id']}. Assigned Segment: {res_data['segment']}.")
-                st.balloons()
-                st.rerun()
-            else:
-                st.error(f"Failed to save order: {res.text}")
+            scaler, kmeans, _ = get_trained_models()
+            features_input = np.array([[
+                float(total_spend),
+                int(num_customizations),
+                int(cart_size),
+                float(fulfillment_time_min),
+                int(customer_satisfaction)
+            ]])
+            scaled_input = scaler.transform(features_input)
+            cluster_id = int(kmeans.predict(scaled_input)[0])
+            segment_name = CLUSTER_NAMES[cluster_id]
+            
+            import datetime
+            now = datetime.datetime.now()
+            df_full = load_full_data()
+            df_len = len(df_full)
+            new_order_id = f"ORD_{df_len + 1:08d}"
+            new_customer_id = f"CUST_{df_len + 10000}"
+            order_date = now.strftime("%Y-%m-%d")
+            order_time = now.strftime("%H:%M")
+            day_of_week = now.strftime("%a")
+            
+            new_row = [
+                new_customer_id, new_order_id, order_date, order_time, day_of_week,
+                order_channel, "STR_999", "Urban", "West",
+                customer_age_group, customer_gender, bool(is_rewards_member), int(cart_size),
+                int(num_customizations), float(total_spend), float(fulfillment_time_min),
+                drink_category, bool(has_food_item), bool(order_ahead), int(customer_satisfaction)
+            ]
+            
+            import csv
+            with open("starbucks_customer_ordering_patterns.csv", "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(new_row)
+                
+            st.cache_data.clear()
+            st.success(f"Success! Order created with ID: {new_order_id}. Assigned Segment: {segment_name}.")
+            st.balloons()
+            st.rerun()
         except Exception as e:
-            st.error(f"API Connection Error: {str(e)}")
+            st.error(f"Failed to save order: {str(e)}")
 
 st.sidebar.image("https://upload.wikimedia.org/wikipedia/en/d/d3/Starbucks_Corporation_Logo_2011.svg", width=120)
 st.sidebar.title("Starbucks Analytics")
-
-if not api_online:
-    st.error("REST API server (api.py) is offline. Start uvicorn before running Streamlit.")
-    st.stop()
 
 st.sidebar.write("---")
 page = st.sidebar.radio("Project Sections:", ["Data Overview", "Boiling Point", "Customer Segmentation"])
@@ -208,21 +308,21 @@ if page == "Data Overview":
             rows_per_page = st.number_input("Rows per Page:", min_value=5, max_value=100, value=10, step=5)
         with col4:
             page_num = st.number_input("Page Number:", min_value=1, value=1, step=1)
-            
-        params = {
-            "limit": rows_per_page,
-            "offset": (page_num - 1) * rows_per_page
-        }
-        if channel_filter != "All":
-            params["channel"] = channel_filter
-        if sat_filter != "All":
-            params["min_satisfaction"] = int(sat_filter)
-            
         try:
-            response = requests.get(f"{API_URL}/orders", params=params)
-            res_data = response.json()
-            orders_list = res_data["data"]
-            total_filtered = res_data["total"]
+            df_full = load_full_data()
+            total_records = len(df_full)
+            
+            df_filtered = df_full.copy()
+            if channel_filter != "All":
+                df_filtered = df_filtered[df_filtered['order_channel'] == channel_filter]
+            if sat_filter != "All":
+                df_filtered = df_filtered[df_filtered['customer_satisfaction'] >= int(sat_filter)]
+                
+            total_filtered = len(df_filtered)
+            offset = (page_num - 1) * rows_per_page
+            limit = rows_per_page
+            
+            orders_list = df_filtered.iloc[offset:offset+limit].to_dict(orient="records")
             
             col_s1, col_s2 = st.columns(2)
             col_s1.metric("Total Rows in DB", f"{total_records:,}")
@@ -411,14 +511,7 @@ elif page == "Boiling Point":
     """)
     
     try:
-        res = requests.get(f"{API_URL}/analytics/hypothesis1")
-        res_data = res.json()
-        threshold = res_data["threshold"]
-        bins_data = pd.DataFrame(res_data["bins"])
-        under_pct = res_data["under_threshold_dissatisfied_pct"]
-        over_pct = res_data["over_threshold_dissatisfied_pct"]
-        anomaly_stats = res_data["anomaly_stats"]
-        long_wait_orders = pd.DataFrame(res_data["long_wait_orders"])
+        threshold, bins_data, under_pct, over_pct, anomaly_stats, long_wait_orders = get_hypothesis1_data()
         
         # CELL 31
         st.subheader("1. Customer Satisfaction Threshold & Bins Analysis (Cell 31)")
@@ -583,12 +676,7 @@ elif page == "Customer Segmentation":
     """)
     
     try:
-        res = requests.get(f"{API_URL}/analytics/hypothesis2")
-        res_data = res.json()
-        
-        profiles = pd.DataFrame(res_data["profiles"])
-        channels = pd.DataFrame(res_data["channel_distribution"])
-        rewards = pd.DataFrame(res_data["rewards_distribution"])
+        profiles, channels, rewards = get_hypothesis2_data()
         
         st.write("---")
         st.subheader("Average Metrics by Segment (Profiles)")
